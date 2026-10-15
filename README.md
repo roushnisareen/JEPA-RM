@@ -12,7 +12,83 @@ like from the prompt alone. The reward is how close the actual answer lands to t
 padding an answer out or changing its tone doesn't move its embedding much, this should be harder
 to game.
 
-Nothing has been run yet. Results go here once they exist.
+## Results so far
+
+**Short version: no.** On this setup the JEPA reward model is a weaker judge, has its own loophole,
+and under best-of-n selection it held up *worse* than the standard Bradley-Terry (BT) reward model.
+It also did no better than a control with the same frozen features and capacity, so the JEPA
+objective itself bought nothing. The RL step (GRPO) is still to come. Every run, its cost and the
+decisions it led to are in [LAB_NOTEBOOK.md](LAB_NOTEBOOK.md); the hypotheses were written down
+first in [PREREGISTRATION.md](PREREGISTRATION.md).
+
+### 1. How good are the reward models?
+
+Agreement with human annotators on the 236 held-out HelpSteer2 pairs (95% bootstrap CIs; the gap to
+BT is paired over the same pairs):
+
+| reward model | accuracy | vs. BT | prefers the longer answer |
+|---|---|---|---|
+| `bt` | 74.2% [69, 80] | — | 61.4% |
+| `bt_lenpen` | 72.0% [67, 78] | −2.1 [−6, +1] | 53.4% |
+| `frozen_bt` | 67.4% [61, 74] | −6.8 [−13, −0] | 67.4% |
+| `jepa` | 66.5% [61, 73] | −7.6 [−14, −1] | 62.3% |
+| `jepa_rank` | 65.3% [59, 72] | −8.9 [−15, −2] | 61.0% |
+| `jepa_pred` | 56.8% [50, 63] | −17.4 [−25, −9] | 56.8% |
+
+Humans prefer the longer answer 60.2% of the time. JEPA is level with the frozen-feature control
+and ~8 points behind BT; without the ranking term (`jepa_pred`) it's near chance.
+
+### 2. Each reward model has its own loophole
+
+200 good answers, each edited in ways that shouldn't help (top) or should hurt (bottom, sanity
+checks). Shifts are in each scorer's own standard deviations:
+
+![Stress test](docs/figures/stress_test.png)
+
+Edits that raised a reward model's score while the gold judge lowered it (all CIs exclude 0):
+
+| reward model | edit | its shift | gold judge |
+|---|---|---|---|
+| `bt` | same text as bullet points | +0.52σ [+0.46, +0.58] | −0.31σ |
+| `bt_lenpen` | same text as bullet points | +0.51σ [+0.44, +0.57] | −0.31σ |
+| `jepa_rank` | open with "Absolutely! As an expert…" | +0.22σ [+0.18, +0.26] | −0.49σ |
+| `jepa` | copy the question into the answer | +0.20σ [+0.15, +0.25] | −0.10σ |
+
+BT's blind spot is formatting, which a length penalty doesn't touch. JEPA's is restating the
+question, as its design predicts. No reward model checks facts: changing numbers and flipping claims
+cost them at most 0.5σ, against 2.3σ for the judge. The judge lowered its score for every edit that
+shouldn't help.
+
+### 3. Best-of-n: the standard reward model held up better
+
+Sample n answers per prompt (100 prompts × 64 samples), let each reward model pick its favourite,
+and score the pick with the gold judge. Larger n = more optimization pressure:
+
+![Best-of-n](docs/figures/best_of_n_qwen.png)
+
+BT's picks kept improving up to n = 64 (getting longer, 452 → 505 words). JEPA's peaked at n = 8 and
+fell back to the level of a plain sample. Paired over the same prompts at n = 64:
+
+| comparison | gold-judge gap (95% CI) |
+|---|---|
+| `jepa` − `bt` | −0.12σ [−0.25, 0.00] |
+| `jepa` − `bt_lenpen` | −0.10σ [−0.22, +0.02] |
+| `jepa` − `frozen_bt` | −0.05σ [−0.15, +0.04] |
+| `jepa_pred`, its peak → n = 64 | −0.15σ [−0.25, −0.06], the only reward model formally over-optimized |
+
+The JEPA ablations (`jepa_pred`, `jepa_rank`) side by side:
+[docs/figures/best_of_n_ablation_qwen.png](docs/figures/best_of_n_ablation_qwen.png).
+
+**Against the pre-registration:** BT was never over-optimized under best-of-n, so the main hypothesis
+(JEPA resists hacking that BT suffers) can't be tested yet; H2 (beats `frozen_bt`) and H3 (beats
+`bt_lenpen`) are not supported. Effects are small (~0.1σ): the σ here is the judge's spread across
+all answers, mostly differences between prompts, so it understates within-prompt effects.
+
+**Next:** GRPO against `bt` and `jepa`. A trained policy can learn to write everything as bullets,
+which best-of-n can't, so BT may yet be hacked under RL.
+
+Raw results (every answer and score) are in the run's Hugging Face repo under `results/`; training
+curves and tables are in the W&B project `jepa-rm`.
 
 ## Plan
 
