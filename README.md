@@ -296,6 +296,15 @@ These are design choices that affect what the results can show, so they belong n
   features and capacity, so comparing against it isolates the objective; accuracy (with CIs) is
   reported next to every hacking result; and the KL-axis figures compare policies that moved the
   same distance from the base model.
+- **The reward models don't see exactly the same training pairs.** BT trains on all 4,601 pairs
+  in one pass, in dataset order. The embedding-space models hold out 5% of prompts to pick their
+  best epoch, so they train on ~95% of the pairs. Either way the held-out comparison uses the same
+  236 pairs, which no model ever saw.
+- **Results so far predate a normalization fix.** Before 2026-10-15 the embedding models fitted
+  their feature normalization (a mean and spread per dimension, no labels) on all training
+  prompts, including the 5% used to pick the best epoch. It now uses the fitting prompts only.
+  The 236 held-out pairs were never included, so the reported accuracies and best-of-n results
+  are unaffected by leakage; retraining with the fix would move them only slightly.
 - **Is it really JEPA?** The predictor targets a frozen encoder's embedding rather than an EMA
   target encoder, and the default loss adds a ranking term. `jepa_pred` (JEPA loss only, no
   negatives) is the purest version; the ablation figure shows how much each term contributes.

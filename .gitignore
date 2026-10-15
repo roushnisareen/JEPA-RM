@@ -9,3 +9,4 @@ results/
 # your own ratings and the answer key from scripts/human_check.py
 human_check*.csv
 human_check*_key.json
+.DS_Store

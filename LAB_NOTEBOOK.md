@@ -309,6 +309,31 @@ The accuracy drop means last pooling isn't a free improvement either.
 
 ---
 
+## 2026-10-15: Fixes after an outside code review (code only, no GPU)
+
+An external review of the public repo raised several points. Checked each against the code:
+
+- **Normalization leak (real, fixed).** `embed_pairs` fitted the feature standardizers on every
+  training prompt and answer before splitting off the 5% that picks the best epoch. No labels were
+  involved, and the 236 held-out pairs were never in it, but the epoch-selection holdout did shape
+  the features. Now the split comes first and the statistics come from the fitting side only. New
+  test `test_normalization_is_fitted_on_the_fit_split_only` fails on the old code. Every result
+  above was produced before this fix; it isn't worth ~$2 to rerun for a change this small, but
+  any rerun will use the fixed code.
+- **Per-epoch loss (fixed, logging only).** The JEPA/frozen heads logged the last minibatch's loss
+  as the epoch loss; now it's the epoch average. No effect on training.
+- **BT trains on unshuffled pairs, embedding models on 95% of them (documented, not changed).**
+  Changing BT's order now would make the code differ from the models the results came from. Added
+  to the README's known limitations.
+- **`.DS_Store` committed (removed, now ignored).**
+- **Already covered:** the review asked for an end-to-end CPU test (`test_pipeline.py` runs the
+  whole flow on tiny models), launch-config checks (`test_modal_defaults.py`), and a human check
+  of the judge (`scripts/human_check.py`, still to be done).
+- **Still open, needs GPU or people:** matched GRPO with more than one seed, the blind human
+  check, and a second gold judge.
+
+---
+
 ## Spending
 
 | | cost |

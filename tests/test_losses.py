@@ -4,8 +4,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from jepa_rm.data import PreferencePair
 from jepa_rm.rewards.bradley_terry import LengthPenalizedRM, bt_loss, length_slope
-from jepa_rm.rewards.embeddings import Standardizer, pool
+from jepa_rm.rewards.embeddings import Standardizer, embed_pairs, pool
 from jepa_rm.rewards.frozen_bt import build_head
 from jepa_rm.rewards.jepa import build_predictor, jepa_loss
 
@@ -56,6 +57,31 @@ def padded_batch():
     hidden = torch.tensor([[[1.0], [2.0], [3.0]], [[10.0], [20.0], [99.0]]])
     mask = torch.tensor([[1, 1, 1], [1, 1, 0]])
     return hidden, mask
+
+
+class FakeEncoder:
+    """A fixed random vector per text, shifted by 1000 if the text contains any of `shifted`."""
+
+    device = "cpu"
+
+    def __init__(self, shifted: set[str] = frozenset()):
+        self.shifted = shifted
+
+    def embed(self, texts):
+        vecs = [torch.randn(4, generator=torch.Generator().manual_seed(sum(map(ord, t)))) for t in texts]
+        return torch.stack([v + 1000.0 * any(s in t for s in self.shifted) for v, t in zip(vecs, texts, strict=True)])
+
+
+def test_normalization_is_fitted_on_the_fit_split_only():
+    pairs = [PreferencePair(f"<q{i:02d}>", f"<good{i:02d}>", f"<bad{i:02d}>") for i in range(20)]
+    clean = embed_pairs(FakeEncoder(), pairs, holdout=0.25)
+    held = [pairs[i] for i in clean.hold.tolist()]
+    shifted = {t for p in held for t in (p.prompt, p.chosen, p.rejected)}
+    # the held-out prompts and answers now embed far away from everything else...
+    moved = embed_pairs(FakeEncoder(shifted), pairs, holdout=0.25)
+    # ...but they don't take part in the normalization statistics, so those are unchanged
+    for a, b in ((clean.ctx_norm, moved.ctx_norm), (clean.tgt_norm, moved.tgt_norm)):
+        assert torch.allclose(a.mean, b.mean) and torch.allclose(a.std, b.std)
 
 
 def test_mean_pooling_ignores_padding():

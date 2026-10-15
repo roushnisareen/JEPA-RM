@@ -147,12 +147,16 @@ def embed_pairs(encoder: Encoder, pairs: Sequence[PreferencePair], holdout: floa
     log.info("embedding %d prompts and %d responses", len(prompts), len(responses))
     ctx_raw = encoder.embed([context_text(p) for p in prompts])
     tgt_raw = encoder.embed([target_text(r) for r in responses])
-    ctx_norm, tgt_norm = Standardizer.fit(ctx_raw), Standardizer.fit(tgt_raw)
 
     device = encoder.device
     p_idx = {p: i for i, p in enumerate(prompts)}
     r_idx = {r: i for i, r in enumerate(responses)}
     fit, hold = split_by_prompt(pairs, holdout)
+    # normalization statistics come from the fit side only, so the holdout that picks the best epoch
+    # has no influence on the features the head trains on
+    fit_ctx = sorted({p_idx[pairs[i].prompt] for i in fit})
+    fit_tgt = sorted({r_idx[r] for i in fit for r in (pairs[i].chosen, pairs[i].rejected)})
+    ctx_norm, tgt_norm = Standardizer.fit(ctx_raw[fit_ctx]), Standardizer.fit(tgt_raw[fit_tgt])
     return PairEmbeddings(
         ctx=ctx_norm(ctx_raw),
         tgt=F.normalize(tgt_norm(tgt_raw), dim=-1),
@@ -183,18 +187,21 @@ def fit_head(
     for epoch in range(cfg.epochs):
         head.train()
         perm = emb.fit[torch.randperm(len(emb.fit), device=emb.fit.device)]
+        losses = []
         for i in range(0, len(perm), cfg.batch_size):
             loss = loss_fn(perm[i : i + cfg.batch_size])
             opt.zero_grad()
             loss.backward()
             opt.step()
+            losses.append(loss.item())
+        epoch_loss = sum(losses) / len(losses)
 
         head.eval()
         with torch.no_grad():
             chosen, rejected = scores_fn(emb.hold)
             acc = (chosen > rejected).float().mean().item()
-        log.info("[%s] epoch %d/%d  loss %.3f  holdout acc %.3f", tag, epoch + 1, cfg.epochs, loss.item(), acc)
-        tracking.log({f"{tag}/epoch": epoch + 1, f"{tag}/loss": loss.item(), f"{tag}/holdout_acc": acc})
+        log.info("[%s] epoch %d/%d  loss %.3f  holdout acc %.3f", tag, epoch + 1, cfg.epochs, epoch_loss, acc)
+        tracking.log({f"{tag}/epoch": epoch + 1, f"{tag}/loss": epoch_loss, f"{tag}/holdout_acc": acc})
         if acc > best_acc:
             best_acc = acc
             best_state = {k: v.detach().clone() for k, v in head.state_dict().items()}
