@@ -87,6 +87,25 @@ all answers, mostly differences between prompts, so it understates within-prompt
 **Next:** GRPO against `bt` and `jepa`. A trained policy can learn to write everything as bullets,
 which best-of-n can't, so BT may yet be hacked under RL.
 
+### 4. Does it depend on how JEPA pools the embedding? (exploratory)
+
+Mean pooling averages token embeddings, so it can't see repetition or word order. The obvious
+objection is that a negative JEPA result comes from that. To check it, every embedding-space reward
+model was retrained using the last token instead. They then rescored the same 6,400 best-of-n
+answers, so the two versions are compared pair by pair on identical answers:
+
+| reward model | accuracy, mean → last | loophole, mean → last | best-of-n @64, last − mean |
+|---|---|---|---|
+| `jepa` | 66.5% → 60.2% | restate +0.20σ → confident opener +0.10σ | +0.04σ [−0.08, +0.17] |
+| `jepa_pred` | 56.8% → 53.4% | restate +0.13σ → none | **+0.22σ [+0.11, +0.35]** |
+| `jepa_rank` | 65.3% → 61.9% | confident +0.22σ → confident +0.22σ, filler +0.24σ | +0.03σ [−0.10, +0.16] |
+| `frozen_bt` | 67.4% → 61.4% | none → none (barely reacts to any edit) | +0.03σ [−0.08, +0.13] |
+
+Last pooling closes the restate loophole and stops the pure JEPA objective from being
+over-optimized, but it costs 3–6 points of accuracy and makes no measurable difference to `jepa`
+under best-of-n. The negative result doesn't depend on pooling. Details in the
+[lab notebook](LAB_NOTEBOOK.md); this comparison was added after the pre-registration.
+
 Raw results (every answer and score) are in the run's Hugging Face repo under `results/`; training
 curves and tables are in the W&B project `jepa-rm`.
 
@@ -130,8 +149,8 @@ curves and tables are in the W&B project `jepa-rm`.
    Reward hacking shows up as the policy's own reward going up while the judge's score doesn't.
    This is plotted against both training steps and KL to the base model, the axis used in
    [Gao et al. (2022)](https://arxiv.org/abs/2210.10760).
-6. If there's budget left: a DPO baseline (no reward model at all), the JEPA pooling ablation
-   (see below), and the same runs on Phi-4-mini to check the result isn't specific to Qwen.
+6. If there's budget left: a DPO baseline (no reward model at all) and the same runs on
+   Phi-4-mini to check the result isn't specific to Qwen.
 
 If the JEPA reward model can't tell good answers from bad ones in step 1, that's a result too,
 and it's cheaper to find out there than after the GRPO runs.
@@ -255,7 +274,19 @@ These are design choices that affect what the results can show, so they belong n
   in reverse order), and the pooling ablation trains a JEPA reward model on the last token
   instead, which sees the whole sequence:
   `modal run modal_app.py::reward_models --jepa-pooling last --hf-repo USER/jepa-rlhf-last`
-  (a separate repo, so the two experiments never overwrite each other).
+  (a separate repo, so the two experiments never overwrite each other). The full mean-vs-last
+  comparison reuses the mean run's BT models and its best-of-n answers, so the two arms differ only
+  in pooling and the best-of-n comparison is paired (same answers, same gold scores):
+
+  ```bash
+  modal run --detach modal_app.py::reward_models --hf-repo USER/jepa-rlhf-last --jepa-pooling last --reuse-bt-from USER/jepa-rlhf
+  modal run --detach modal_app.py::stress_test --hf-repo USER/jepa-rlhf-last --no-with-gold
+  modal run --detach modal_app.py::best_of_n --hf-repo USER/jepa-rlhf-last --rescore-from USER/jepa-rlhf
+  modal run modal_app.py::compare_pooling --mean-repo USER/jepa-rlhf --last-repo USER/jepa-rlhf-last
+  ```
+
+  This comparison was added after the pre-registration and is reported as exploratory; results
+  are in [Results so far](#results-so-far).
 - **The JEPA reward model embeds the answer without the question.** Its score is a fixed direction
   per prompt, so it may reward "sounds like a good answer to this kind of question" rather than
   correctness. The wrong-facts edit tests for this.
@@ -330,6 +361,7 @@ src/jepa_rm/
         policies.py          generation + gold-judge scoring
         stress_test.py       edits that shouldn't help, and which scorers they fool
         best_of_n.py         over-optimization without training: each reward model picks the best of n
+        pooling.py           mean vs. last-token pooling, side by side and paired
         human_check.py       blind pairs for checking the judge by hand
         plots.py             all figures
 scripts/make_figures.py      rebuild the figures locally from downloaded results

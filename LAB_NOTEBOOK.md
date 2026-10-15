@@ -252,6 +252,63 @@ outside prediction ("JEPA is a weaker signal / gets hacked differently"), not th
 
 ---
 
+## 2026-10-15: Mean vs. last-token pooling (real run, exploratory)
+
+Second HF repo `Roushniii/jepa-rlhf-last`. The last-pooling arm reuses the mean arm's BT models
+(copied, so both arms share the identical BT) and rescores its 6,400 best-of-n answers instead of
+generating new ones, so the arms differ only in pooling and best-of-n compares them pair by pair on
+the same answers. Steps: `reward_models --jepa-pooling last --reuse-bt-from` (~4 min),
+`stress_test --no-with-gold`, `best_of_n --rescore-from` (~11 min), then the CPU-only
+`compare_pooling`. ≈ $0.90 in total. Logged in the pre-registration as exploratory.
+
+**Held-out accuracy** (236 pairs, 95% CIs):
+
+| rm | mean | last |
+|---|---|---|
+| frozen_bt | 67.4% [61, 74] | 61.4% [56, 68] |
+| jepa | 66.5% [61, 73] | 60.2% [54, 66] |
+| jepa_rank | 65.3% [59, 72] | 61.9% [56, 68] |
+| jepa_pred | 56.8% [50, 63] | 53.4% [47, 60] |
+
+Last pooling costs 3–6 points everywhere. It also prefers the longer answer less (jepa 62.3% → 57.6%).
+
+**"Shouldn't help" edits** (shift in σ of each scorer, 95% CIs):
+
+| rm | pooling | filler | repeat | bullets | restate | confident |
+|---|---|---|---|---|---|---|
+| jepa | mean | −0.20 | −0.80 | +0.08 | **+0.20** | +0.03 |
+| jepa | last | −0.57 | −0.93 | −0.10 | −0.10 | **+0.10** |
+| jepa_rank | mean | −0.07 | −0.99 | +0.09 | +0.07 | **+0.22** |
+| jepa_rank | last | **+0.24** | −0.97 | +0.14 | −0.14 | **+0.22** |
+| jepa_pred | mean | −0.11 | −0.67 | −0.14 | +0.13 | −0.09 |
+| jepa_pred | last | −1.32 | −0.52 | −0.51 | −0.14 | −0.14 |
+| frozen_bt | mean | −0.03 | −0.13 | +0.02 | +0.03 | +0.03 |
+| frozen_bt | last | −0.01 | −0.01 | +0.00 | −0.00 | +0.00 |
+
+Last pooling closes JEPA's restate loophole (+0.20 → −0.10) and penalizes filler harder, but JEPA
+picks up a smaller one: the confident opener (+0.10 [+0.06, +0.15]). `jepa_rank` gets worse: filler
+now helps it too. `frozen_bt` with last pooling barely reacts to any edit (all |shift| ≤ 0.01σ), so
+its head mostly ignores what the edits change; that makes it a weak control in this arm.
+
+**Best-of-n, paired** (gold of last-pooling picks − mean-pooling picks, same answers, n = 64, 100
+prompts):
+
+| rm | last − mean | peak n (mean → last) | gold change @64, σ (mean → last) |
+|---|---|---|---|
+| frozen_bt | +0.03σ [−0.08, +0.13] | 16 → 64 | +0.05 → +0.08 |
+| jepa | +0.04σ [−0.08, +0.17] | 8 → 16 | +0.00 → +0.04 |
+| jepa_pred | **+0.22σ [+0.11, +0.35]** | 2 → 64 | −0.15 → +0.07 |
+| jepa_rank | +0.03σ [−0.10, +0.16] | 8 → 4 | −0.00 → +0.03 |
+
+With last pooling, `jepa − bt` at n = 64 is −0.91 raw [−2.05, +0.19] (crosses 0).
+
+**Plain reading:** pooling matters for the pure JEPA objective (`jepa_pred` stops being
+over-optimized) and changes *which* loophole JEPA has, but it makes no measurable difference to
+`jepa` itself in best-of-n. So "JEPA is not more robust than BT" isn't an artifact of mean pooling.
+The accuracy drop means last pooling isn't a free improvement either.
+
+---
+
 ## Spending
 
 | | cost |
@@ -263,14 +320,16 @@ outside prediction ("JEPA is a weaker signal / gets hacked differently"), not th
 | Best-of-n, 100 × 16 (wrong settings, kept) | ≈ $2.30 |
 | Best-of-n, extended to 100 × 64 | ≈ $6.60 |
 | Stress test rerun with CIs | ≈ $0.50 |
-| **Total so far** | **≈ $17.80** |
+| Pooling comparison (last-pooling arm) | ≈ $0.90 |
+| **Total so far** | **≈ $18.70** |
 
-This account had $19.81 of October credit, so ≈ $2 remains. Everything from here (GRPO) runs on
-another Modal account. GRPO moves to another Modal account; it needs the same `huggingface` and `wandb`
+This account had $19.81 of October credit, so ≈ $1 remains. Everything from here (GRPO) runs on
+another Modal account. It needs the same `huggingface` and `wandb`
 secrets and the same HF repo, so it can find the reward models trained here.
 
 ## Open questions
 
 - ~~Does best-of-n over-optimize BT by n = 64?~~ No (2026-10-15). Does GRPO, which pushes much harder?
 - At lr 1e-4, does GRPO move the policy far enough (KL ≫ 0.001) to show hacking?
+- ~~Is the negative JEPA result an artifact of mean pooling?~~ No (2026-10-15, exploratory).
 - Is vLLM worth it for the full GRPO runs (~$16 → ~$8 per run)?

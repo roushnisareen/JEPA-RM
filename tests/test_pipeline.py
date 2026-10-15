@@ -10,6 +10,7 @@ Needs network once to download the tiny models (~20 MB each). Skip with `pytest 
 from dataclasses import replace
 
 import pytest
+import torch
 from safetensors.torch import load_file
 
 from jepa_rm.artifacts import LocalStore, MissingArtifactError, checkpoint_dir, rm_dir
@@ -152,3 +153,43 @@ def test_phi_policy_trains_and_generates(tiny, tmp_path):
     answers = policies.generate(PROMPTS[:2], store.download_dir(folder),
                                 EvalConfig(policy="phi", batch_size=2, max_new_tokens=8), device="cpu")
     assert len(answers) == 2 and all(isinstance(a.response, str) and a.kl >= 0 for a in answers)
+
+
+def test_pooling_ablation_reuses_bt_rescores_the_same_answers_and_compares(tiny, tmp_path):
+    from jepa_rm.evaluation.plots import plot_pooling
+    from jepa_rm.evaluation.pooling import compare_pooling
+    from jepa_rm.rewards import EMBEDDING_KINDS
+
+    work = tmp_path / "work"
+    stores = {"mean": LocalStore(tmp_path / "mean"), "last": LocalStore(tmp_path / "last")}
+    bt_cfg = BTConfig(base_model=TINY_LM, batch_size=4, max_len=128)
+    jepa_cfg = JepaConfig(encoder=TINY_LM, embed_layer=-1, max_len=128, predictor_hidden=32, epochs=2,
+                          batch_size=8, holdout=0.25)
+
+    # mean arm: everything trained, then best-of-n
+    mean_models = train_reward_models(PAIRS, work / "mean", bt_cfg, jepa_cfg, device="cpu")
+    # last arm: BT copied from the mean arm, only the embedding-space kinds retrained
+    last_models = train_reward_models(PAIRS, work / "last", bt_cfg, replace(jepa_cfg, pooling="last"), device="cpu",
+                                      bt_from=work / "mean")
+    for pooling, models in (("mean", mean_models), ("last", last_models)):
+        for kind in REWARD_KINDS:
+            stores[pooling].upload_dir(work / pooling / rm_dir(kind), rm_dir(kind))
+        stores[pooling].save_result("reward_models.json", compare_reward_models(PAIRS[:6], models))
+    bt_weights = "rm_bt/adapter_model.safetensors"
+    assert (stores["mean"].root / bt_weights).read_bytes() == (stores["last"].root / bt_weights).read_bytes()
+    assert torch.load(stores["last"].root / "rm_jepa/jepa.pt")["config"]["pooling"] == "last"
+
+    bon_cfg = BonConfig(n_prompts=2, n_samples=4, ns=(2, 4), batch_size=8, max_new_tokens=8, gold_rm=TINY_JUDGE)
+    best_of_n.run_best_of_n(stores["mean"], bon_cfg)
+    best_of_n.run_best_of_n(stores["last"], bon_cfg, rescore_from=stores["mean"])
+
+    mean_bon, last_bon = (stores[p].load_result("best_of_n_qwen.json") for p in ("mean", "last"))
+    assert [s["response"] for s in mean_bon["samples"]] == [s["response"] for s in last_bon["samples"]]
+    assert [s["gold"] for s in mean_bon["samples"]] == [s["gold"] for s in last_bon["samples"]]
+
+    arms = {p: {"reward_models": stores[p].load_result("reward_models.json"), "stress": {},
+                "bon": stores[p].load_result("best_of_n_qwen.json")} for p in stores}
+    result = compare_pooling(arms)
+    assert {r["kind"] for r in result["paired_best_of_n"]} == set(EMBEDDING_KINDS)
+    assert {r["pooling"] for r in result["accuracy"]} == {"mean", "last"}
+    assert plot_pooling({p: a["bon"] for p, a in arms.items()}).startswith(b"\x89PNG")

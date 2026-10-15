@@ -19,6 +19,10 @@ from typing import Protocol
 REWARD_KINDS = ("bt", "bt_lenpen", "frozen_bt", "jepa", "jepa_pred", "jepa_rank")
 JEPA_VARIANTS = {"jepa": {}, "jepa_pred": {"rank_weight": 0.0}, "jepa_rank": {"jepa_weight": 0.0}}
 
+# BT reads the text itself and never pools; the embedding-space kinds all depend on the pooling
+BT_KINDS = ("bt", "bt_lenpen")
+EMBEDDING_KINDS = ("frozen_bt", "jepa", "jepa_pred", "jepa_rank")
+
 # what JEPA is compared against, head to head on the same prompts
 COMPARISONS = (("jepa", "bt"), ("jepa", "bt_lenpen"), ("jepa", "frozen_bt"), ("jepa", "jepa_pred"),
                ("jepa", "jepa_rank"))

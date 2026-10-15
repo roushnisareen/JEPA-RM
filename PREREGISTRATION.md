@@ -101,4 +101,5 @@ Date: ___   Commit: (the commit that adds this file)
 |---|---|---|
 | 2026-10-14 | GRPO pilot (`bt`, lr 1e-5) stopped at step ~37 of 60; next pilot at lr 1e-4 | KL to the base model stayed ~0.001 per token through step 35 and reward and answer length showed no trend, so at lr 1e-5 the policy barely moves and H0 can't be tested. Raising the learning rate once is the response planned under H0. |
 | 2026-10-14 | Answer length limit raised from 768 to 1,536 tokens | Before any real run, a GPU check found 31% of the base model's answers cut off at 768 tokens, which would cap the length hacking being measured. |
+| 2026-10-15 | Added a mean vs. last-token pooling comparison (exploratory, not pre-registered) | Mean pooling ignores repetition and word order by construction, the most obvious objection to a negative JEPA result. Its results are reported as exploratory: no hypothesis above depends on them. |
 | 2026-10-14 | Best-of-n run before further GRPO | Budget: best-of-n is the primary evidence and needs no tuning; GRPO resumes once a pilot shows the policy moving. |

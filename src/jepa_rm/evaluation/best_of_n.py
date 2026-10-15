@@ -24,7 +24,7 @@ from jepa_rm.data import load_prompts
 from jepa_rm.evaluation.plots import plot_reward_hacking
 from jepa_rm.evaluation.policies import format_table, generate, score_all, score_keys
 from jepa_rm.evaluation.stats import bootstrap_ci, format_comparisons, paired_gap
-from jepa_rm.rewards import COMPARISONS, JEPA_ABLATION, MAIN_COMPARISON, REWARD_KINDS
+from jepa_rm.rewards import COMPARISONS, EMBEDDING_KINDS, JEPA_ABLATION, MAIN_COMPARISON, REWARD_KINDS
 
 log = logging.getLogger(__name__)
 
@@ -121,10 +121,27 @@ def sample_answers(
     return samples
 
 
-def run_best_of_n(store: Store, cfg: BonConfig, extend: bool = False) -> list[dict]:
+def rescore(samples: list[dict], store: Store, gold_rm: str, kinds: Sequence[str]) -> list[dict]:
+    """Copies of `samples` with the given kinds' scores replaced by this store's reward models.
+    Everything else (answers, gold-judge scores, the other kinds' scores) is kept as it was."""
+    samples = [{k: v for k, v in s.items() if k not in kinds} for s in samples]
+    score_all(store, samples, gold_rm, kinds=kinds, gold=False)
+    return samples
+
+
+def run_best_of_n(
+    store: Store, cfg: BonConfig, extend: bool = False, rescore_from: Store | None = None
+) -> list[dict]:
     """With `extend`, keep the samples of the previous run (same prompts, already scored) and only
     sample the extra answers needed to reach `cfg.n_samples` per prompt. The previous result is
-    saved under a separate name first, so nothing is lost."""
+    saved under a separate name first, so nothing is lost.
+
+    With `rescore_from`, take another store's samples and gold scores as they are and rescore only
+    the embedding-space kinds with this store's reward models: a pooling ablation on the very same
+    answers, at no generation cost.
+    """
+    if extend and rescore_from is not None:
+        raise ValueError("extend and rescore_from can't be combined")
     if max(cfg.ns) > cfg.n_samples:
         raise ValueError(f"largest n ({max(cfg.ns)}) needs at least that many samples, got {cfg.n_samples}")
     name = f"best_of_n_{cfg.policy}"
@@ -132,7 +149,19 @@ def run_best_of_n(store: Store, cfg: BonConfig, extend: bool = False) -> list[di
     if extend and previous is None:
         raise ValueError(f"nothing to extend: results/{name}.json not found")
 
-    if previous:
+    source = None
+    if rescore_from is not None:
+        source = rescore_from.load_result(f"{name}.json")
+        if source is None:
+            raise ValueError(f"nothing to rescore: results/{name}.json not found in the source store")
+        samples = rescore(source["samples"], store, cfg.gold_rm, EMBEDDING_KINDS)
+        prompts = list(dict.fromkeys(s["prompt"] for s in samples))
+        have = min(Counter(s["prompt"] for s in samples).values())
+        if max(cfg.ns) > have:
+            raise ValueError(f"largest n ({max(cfg.ns)}) needs {max(cfg.ns)} samples per prompt; the source has {have}")
+        log.info("rescored %d samples (%d prompts) with this store's %s", len(samples), len(prompts),
+                 ", ".join(EMBEDDING_KINDS))
+    elif previous:
         old = previous["samples"]
         prompts = list(dict.fromkeys(s["prompt"] for s in old))
         have = min(Counter(s["prompt"] for s in old).values())
@@ -141,13 +170,15 @@ def run_best_of_n(store: Store, cfg: BonConfig, extend: bool = False) -> list[di
         log.info("extending %d prompts from %d to %d samples each", len(prompts), have, cfg.n_samples)
     else:
         old, prompts, have = [], load_prompts("validation", cfg.n_prompts), 0
-    new = sample_answers(store, cfg, prompts, have, cfg.n_samples - have) if cfg.n_samples > have else []
-    samples = old + new
+    if source is None:
+        new = sample_answers(store, cfg, prompts, have, cfg.n_samples - have) if cfg.n_samples > have else []
+        samples = old + new
 
     rows, base_std = best_of_n_curves(samples, cfg.ns)
     comparisons = compare_selectors(samples, max(cfg.ns))
     store.save_result(f"{name}.json", {
-        "config": {**asdict(cfg), "n_prompts": len(prompts), "extended_from": have if previous else None},
+        "config": {**asdict(cfg), "n_prompts": len(prompts), "extended_from": have if previous else None,
+                   "rescored_from": getattr(rescore_from, "repo", None) if source else None},
         "summary": rows, "base_std": base_std, "comparisons": comparisons, "samples": samples,
     })
     log.info("\n%s\n\n%s", format_table(rows), format_comparisons(comparisons))

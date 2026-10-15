@@ -342,3 +342,43 @@ def plot_stress_test(results: Mapping, fmt: str = "png") -> bytes:
 
         fig.tight_layout()
         return _encode(fig, fmt)
+
+
+def plot_pooling(
+    bon_by_pooling: Mapping[str, Mapping], kinds: Sequence[str] = ("frozen_bt", "jepa"), fmt: str = "png"
+) -> bytes:
+    """Gold-judge change of each kind's best-of-n picks as n grows: solid = mean pooling, dashed =
+    last-token pooling. Both arms pick from the same answers, so any gap is the pooling's doing."""
+    styles = {"mean": "-", "last": (0, (5, 3))}
+    with plt.rc_context(STYLE):
+        fig, ax = plt.subplots(figsize=(9.5, 4.4))
+        ends = []
+        for pooling, bon in bon_by_pooling.items():
+            summary, std = bon["summary"], bon["base_std"]["gold"] or 1.0
+            base = next(r for r in summary if r["run"] == "base")
+            for kind in kinds:
+                curve = sorted((r for r in summary if r["run"] == kind), key=lambda r: r["step"])
+                if not curve:
+                    continue
+                ns = [1] + [r["step"] for r in curve]
+                gold = [0.0] + [(r["gold"] - base["gold"]) / std for r in curve]
+                ax.plot(ns, gold, color=color(kind), ls=styles.get(pooling, "-"), lw=2.2, marker="o", ms=4,
+                        mec="white", mew=1.0)
+                ends.append((kind, ns[-1], gold[-1], f"{label(kind)}, {pooling} pooling  {gold[-1]:+.2f}σ"))
+        ax.set_xscale("log", base=2)
+        all_ns = sorted({1} | {r["step"] for bon in bon_by_pooling.values()
+                               for r in bon["summary"] if r["run"] != "base"})
+        ax.set_xticks(all_ns, [str(n) for n in all_ns])
+        ax.axhline(0, color=COLORS["base"], lw=1, ls=(0, (4, 3)), zorder=0)
+        ax.set(title="Best-of-n with mean vs. last-token pooling  (same answers)",
+               xlabel="n, answers sampled per question (log scale)", ylabel="gold judge, change vs. base (σ)")
+        xmin, xmax = ax.get_xlim()
+        ax.set_xlim(right=xmax * 6)  # room for the line labels on a log axis
+        lo, hi = ax.get_ylim()
+        gap = 0.08 * (hi - lo)
+        ys = spread_labels([y for _, _, y, _ in ends], gap, lo + gap / 2, hi - gap / 2)
+        for (kind, x, _, text), y in zip(ends, ys, strict=True):
+            ax.annotate(text, xy=(x, y), xytext=(7, 0), textcoords="offset points", va="center",
+                        color=color(kind), fontsize=9, fontweight="bold", annotation_clip=False)
+        fig.tight_layout()
+        return _encode(fig, fmt)

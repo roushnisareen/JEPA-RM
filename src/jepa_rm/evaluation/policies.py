@@ -167,13 +167,18 @@ def generate(
     return [Generated(strip_think(t), c, k) for t, c, k in zip(texts, cut, kls, strict=True)]
 
 
-def score_all(store: Store, generations: list[dict], gold_rm: str) -> None:
-    """Add "gold", "bt" and "jepa" scores to every generation, loading one scorer at a time."""
+def score_all(
+    store: Store, generations: list[dict], gold_rm: str, kinds: Sequence[str] = REWARD_KINDS, gold: bool = True
+) -> None:
+    """Add the gold judge's and each reward model kind's score to every generation, loading one
+    scorer at a time. `kinds` and `gold` pick a subset, e.g. to rescore only the kinds that changed."""
     P = [g["prompt"] for g in generations]
     R = [g["response"] for g in generations]
-    scores = {"gold": GoldJudge(gold_rm).score(P, R)}
-    free_memory()
-    for kind in REWARD_KINDS:
+    scores = {}
+    if gold:
+        scores["gold"] = GoldJudge(gold_rm).score(P, R)
+        free_memory()
+    for kind in kinds:
         scores[kind] = load_reward_model(kind, store.download_dir(rm_dir(kind))).score(P, R)
         free_memory()
     for i, g in enumerate(generations):
