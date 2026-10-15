@@ -1,0 +1,11 @@
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+wandb/
+results/
+figures/
+# your own ratings and the answer key from scripts/human_check.py
+human_check*.csv
+human_check*_key.json

@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jepa-rm"
+version = "0.1.0"
+description = "Does a JEPA-style reward model resist reward hacking in RLHF?"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "torch==2.6.0",
+    "transformers==4.51.3",
+    "trl==0.17.0",
+    "peft==0.15.2",
+    "datasets==3.5.0",
+    "accelerate==1.6.0",
+    "huggingface_hub==0.30.2",
+    "scipy==1.15.2",
+    "matplotlib==3.10.1",
+    "wandb==0.19.10",
+]
+
+[project.optional-dependencies]
+dev = ["modal", "pytest>=8", "ruff>=0.6"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = ["integration: runs the whole pipeline on tiny models on CPU (downloads ~60 MB once)"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
