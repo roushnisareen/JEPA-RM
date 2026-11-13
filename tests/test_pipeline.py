@@ -31,7 +31,7 @@ pytestmark = pytest.mark.integration
 
 TINY_LM = "trl-internal-testing/tiny-Qwen3ForCausalLM"
 TINY_JUDGE = "trl-internal-testing/tiny-Qwen3ForSequenceClassification"
-TINY_PHI = "trl-internal-testing/tiny-Phi3ForCausalLM"  # Phi-4-mini uses the Phi-3 architecture
+TINY_PHI = "trl-internal-testing/tiny-Phi3ForCausalLM-3.5"  # Phi-4-mini uses the Phi-3 architecture
 
 PAIRS = [
     PreferencePair(
