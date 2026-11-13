@@ -10,6 +10,7 @@ Modal accounts:
     modal run modal_app.py::grpo --hf-repo USER/jepa-rlhf --rm bt
     modal run modal_app.py::grpo --hf-repo USER/jepa-rlhf --rm jepa
     modal run modal_app.py::evaluate --hf-repo USER/jepa-rlhf
+    modal run modal_app.py::rescore --hf-repo USER/jepa-rlhf
     modal run modal_app.py::dpo --hf-repo USER/jepa-rlhf
 """
 import modal
@@ -104,16 +105,19 @@ def reward_models(hf_repo: str, max_pairs: int = 0, jepa_pooling: str = "mean", 
                           if not isinstance(v, list)})
         tracking.summary({"val/humans_prefer_longer": results["humans_prefer_longer"]})
 
-
-@app.function(image=image, gpu=GPU, secrets=SECRETS, volumes=VOLUMES, timeout=6 * HOUR)
+# the full BT run took 6.3 h for 200 steps; 8 h leaves room and caps the cost at ~$20
+# (A100 at ~$2.50/h). Checkpoints upload as the run goes
+@app.function(image=image, gpu=GPU, secrets=SECRETS, volumes=VOLUMES, timeout=8 * HOUR)
 def grpo(
-    hf_repo: str, rm: str = "bt", policy: str = "qwen", max_steps: int = 200, seed: int = 0, lr: float = 1e-5
+    hf_repo: str, rm: str = "bt", policy: str = "qwen", max_steps: int = 200, seed: int = 0, lr: float = 1e-4,
+    resume_step: int = 0,
 ):
     """GRPO on the policy model against one reward model (any kind; see jepa_rm/rewards).
 
-    Pilot first: `--max-steps 60` against bt, then check KL and gold-vs-proxy in W&B. If the BT run
-    isn't being over-optimized, raise `--lr` or `--max-steps` before running the full comparison;
-    there's nothing to compare if the standard reward model never gets hacked.
+    Pilot first: `--max-steps 60` against bt, then check KL and gold-vs-proxy in W&B. The first pilot
+    (lr 1e-5) didn't move the policy at all, hence the current default. If the BT run still isn't
+    being over-optimized, there's nothing to compare: the standard reward model has to get hacked.
+    A run that stopped can continue from one of its saved checkpoints with `--resume-step 100`.
     """
     _setup()
     from dataclasses import asdict
@@ -123,7 +127,7 @@ def grpo(
     from jepa_rm.config import GrpoRunConfig
     from jepa_rm.training.grpo import train_grpo
 
-    cfg = GrpoRunConfig(policy=policy, max_steps=max_steps, seed=seed, lr=lr)
+    cfg = GrpoRunConfig(policy=policy, max_steps=max_steps, seed=seed, lr=lr, resume_step=resume_step)
     config = {"hf_repo": hf_repo, "rm": rm, **asdict(cfg)}
     with tracking.run(f"grpo-{policy}-{rm}-s{seed}", job_type="grpo", config=config):
         train_grpo(HubStore(hf_repo), rm, cfg)
@@ -161,6 +165,19 @@ def evaluate(hf_repo: str, policy: str = "qwen", runs: str = "bt,jepa", seeds: s
     cfg = EvalConfig(policy=policy, runs=run_names, seeds=seed_list, n_prompts=n_prompts)
     with tracking.run(f"eval-{policy}", job_type="evaluate", config={"hf_repo": hf_repo, **asdict(cfg)}):
         evaluate_policies(HubStore(hf_repo), cfg)
+
+
+@app.function(image=image, gpu=GPU, secrets=SECRETS, volumes=VOLUMES, timeout=HOUR)
+def rescore(hf_repo: str, policy: str = "qwen"):
+    """Clean the saved evaluation answers again and rescore them, without generating new ones."""
+    _setup()
+    from jepa_rm import tracking
+    from jepa_rm.artifacts import HubStore
+    from jepa_rm.config import EvalConfig
+    from jepa_rm.evaluation.policies import rescore_policies
+
+    with tracking.run(f"rescore-{policy}", job_type="evaluate", config={"hf_repo": hf_repo, "policy": policy}):
+        rescore_policies(HubStore(hf_repo), EvalConfig(policy=policy))
 
 
 @app.function(image=image, gpu=GPU, secrets=SECRETS, volumes=VOLUMES, timeout=HOUR)
@@ -225,7 +242,7 @@ def best_of_n(
     from jepa_rm.config import BonConfig
     from jepa_rm.evaluation.best_of_n import run_best_of_n
 
-    ns = tuple(n for n in (2, 4, 8, 16, 32, 64) if n <= n_samples)
+    ns = tuple(n for n in BonConfig().ns if n <= n_samples)
     cfg = BonConfig(policy=policy, n_prompts=n_prompts, n_samples=n_samples, ns=ns)
     with tracking.run(f"best-of-n-{policy}", job_type="best_of_n", config={"hf_repo": hf_repo, **asdict(cfg)}):
         source = HubStore(rescore_from) if rescore_from else None

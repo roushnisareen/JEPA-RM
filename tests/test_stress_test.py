@@ -1,3 +1,5 @@
+import statistics
+
 import pytest
 
 from jepa_rm.data import PreferencePair
@@ -156,3 +158,15 @@ def test_each_shift_has_a_ci_and_the_raw_scores_are_kept():
     lo, hi = filler["ci_sigma"]
     assert lo <= filler["delta_sigma"] <= hi and lo > 0  # filler always adds length, so it always helps here
     assert set(results["scores"]["length"]) >= {"original", "filler"}
+
+
+def test_sigma_ci_widens_when_the_spread_itself_is_uncertain():
+    from jepa_rm.evaluation.stress_test import sigma_ci
+
+    diffs = [0.1] * 20
+    steady = [float(i) for i in range(20)]
+    lo, hi = sigma_ci(diffs, steady)
+    assert lo <= 0.1 / statistics.stdev(steady) <= hi
+    spiky = [0.0] * 19 + [10.0]  # the spread depends on whether the one outlier is resampled
+    lo2, hi2 = sigma_ci(diffs, spiky)
+    assert hi2 - lo2 > hi - lo

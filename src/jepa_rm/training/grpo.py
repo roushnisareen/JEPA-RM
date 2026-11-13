@@ -6,21 +6,23 @@ reward and the gold judge's score drift apart over training.
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 
+import torch
 from datasets import Dataset
-from peft import LoraConfig
-from transformers import TrainerCallback
+from peft import LoraConfig, PeftModel
+from transformers import AutoModelForCausalLM, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer
 
 from jepa_rm import tracking
-from jepa_rm.artifacts import Store, checkpoint_dir, grpo_log_name, policy_dir, rm_dir
+from jepa_rm.artifacts import MissingArtifactError, Store, checkpoint_dir, grpo_log_name, policy_dir, rm_dir
 from jepa_rm.config import LORA, POLICIES, GrpoRunConfig
 from jepa_rm.data import NO_THINK, load_prompts, strip_think, user_message
 from jepa_rm.rewards import RewardModel, check_kind, load_reward_model
-from jepa_rm.runtime import model_dtype, on_gpu
+from jepa_rm.runtime import model_dtype, on_gpu, set_sampling
 
 log = logging.getLogger(__name__)
 ADAPTER_FILES = ["adapter_*"]
@@ -57,9 +59,16 @@ def make_reward_fn(rm: RewardModel, name: str) -> Callable[..., list[float]]:
     return reward
 
 
-def save_log(store: Store, cfg: GrpoRunConfig, run: str, history: list[dict], complete: bool) -> None:
+def resume_run(run: str) -> str:
+    """Where a run keeps its resume points: next to its checkpoints, under a name evaluation skips."""
+    return f"{run}_resume"
+
+
+def save_log(store: Store, cfg: GrpoRunConfig, run: str, history: list[dict], complete: bool,
+             resumed_from: list[int] | None = None) -> None:
     store.save_result(grpo_log_name(cfg.policy, run, cfg.seed),
-                      {"config": asdict(cfg), "rm": run, "complete": complete, "log": history})
+                      {"config": asdict(cfg), "rm": run, "complete": complete, "log": history,
+                       "resumed_from": resumed_from or []})
 
 
 class UploadCheckpoints(TrainerCallback):
@@ -69,18 +78,34 @@ class UploadCheckpoints(TrainerCallback):
     An upload that still fails after the store's own retries is logged and remembered rather than
     raised: crashing would throw away hours of training over one network error. `retry_failed`
     tries those again once training is over (checkpoints stay on disk until the job ends).
+
+    A resumed run (`resumed_from`, the steps it and its predecessors restarted at) counts its steps
+    from where the earlier one stopped, and its log is appended to the earlier one's. Saves that
+    aren't one of the run's checkpoints go to its resume points (`resume_run`).
     """
 
-    def __init__(self, store: Store, cfg: GrpoRunConfig, run: str):
+    def __init__(self, store: Store, cfg: GrpoRunConfig, run: str, earlier_log: list[dict] | None = None,
+                 resumed_from: list[int] | None = None):
         self.store, self.cfg, self.run = store, cfg, run
+        self.earlier_log = earlier_log or []
+        self.resumed_from = resumed_from or []
+        self.offset = self.resumed_from[-1] if self.resumed_from else 0
         self.failed: list[tuple[Path, str]] = []
+
+    def full_log(self, log_history: list[dict]) -> list[dict]:
+        shifted = [{**e, "step": e["step"] + self.offset} if "step" in e else e for e in log_history]
+        return self.earlier_log + shifted
 
     def on_save(self, args, state, control, **kwargs):
         local = Path(args.output_dir) / f"checkpoint-{state.global_step}"
-        remote = checkpoint_dir(self.cfg.policy, self.run, state.global_step, self.cfg.seed)
+        step = state.global_step + self.offset
+        is_checkpoint = step % max(1, self.cfg.max_steps // self.cfg.n_checkpoints) == 0
+        remote = checkpoint_dir(self.cfg.policy, self.run if is_checkpoint else resume_run(self.run), step,
+                                self.cfg.seed)
         try:
             self.store.upload_dir(local, remote, allow_patterns=ADAPTER_FILES)
-            save_log(self.store, self.cfg, self.run, state.log_history, complete=False)
+            save_log(self.store, self.cfg, self.run, self.full_log(state.log_history), complete=False,
+                     resumed_from=self.resumed_from)
             log.info("uploaded %s", remote)
         except Exception:
             log.exception("could not upload %s; training continues and it will be retried at the end", remote)
@@ -94,21 +119,60 @@ class UploadCheckpoints(TrainerCallback):
         self.failed.clear()
 
 
+def unseen_prompts(prompts: list[str], cfg: GrpoRunConfig, resumed_from: list[int]) -> list[str]:
+    """The prompts a run that restarted at each step in `resumed_from` hadn't reached yet.
+
+    TRL 0.17 draws prompts in one shuffled pass (its RepeatSampler: `torch.randperm` with a generator
+    seeded by the run's seed), batch_size * grad_accum / num_generations of them per step, so a run
+    that stopped after k steps used exactly the first k * that many of this order. A resumed run
+    shuffles its own, smaller prompt list the same way, so each restart is one more round of this.
+    """
+    per_step = cfg.batch_size * cfg.grad_accum // cfg.num_generations
+    start = 0
+    for stop in resumed_from:
+        order = torch.randperm(len(prompts), generator=torch.Generator().manual_seed(cfg.seed)).tolist()
+        used = set(order[: (stop - start) * per_step])
+        prompts = [p for i, p in enumerate(prompts) if i not in used]
+        start = stop
+    return prompts
+
+
 def train_grpo(store: Store, rm_kind: str, cfg: GrpoRunConfig, work_dir: str | Path = "/tmp") -> list[dict]:
     rm = load_reward_model(check_kind(rm_kind), store.download_dir(rm_dir(rm_kind)))
     out = policy_dir(cfg.policy, rm_kind, cfg.seed)
-    # checkpoints left by an earlier run (e.g. a quick smoke test) would otherwise be evaluated
-    # alongside this run's
-    if store.delete_dir(out):
-        log.warning("deleted old checkpoints in %s before starting", out)
+    resume, resumed_from, earlier_log = 0, [], None
+    if cfg.resume_step:
+        # Continue a run that stopped (e.g. out of credit) from its checkpoint `cfg.resume_step`, or
+        # from a later resume point if a continuation was itself cut off (a preempted Modal job is
+        # restarted with the same arguments): the same linear learning-rate schedule from where it
+        # was, on the prompts it hadn't reached. Only the adapter is saved, not the optimizer, so
+        # Adam's moments restart at each of these.
+        earlier = store.load_result(grpo_log_name(cfg.policy, rm_kind, cfg.seed))
+        saved = dict(store.checkpoints(cfg.policy, rm_kind, cfg.seed))
+        if earlier is None or cfg.resume_step not in saved:
+            raise MissingArtifactError(f"no checkpoint {cfg.resume_step} with its log for {out} to resume from")
+        saved |= dict(store.checkpoints(cfg.policy, resume_run(rm_kind), cfg.seed))
+        resume = max(s for s in saved if cfg.resume_step <= s < cfg.max_steps)
+        resumed_from = [s for s in earlier.get("resumed_from", []) if s < resume] + [resume]
+        earlier_log = [e for e in earlier["log"] if e.get("step", 0) <= resume]
+        adapter = store.download_dir(saved[resume])
+        log.info("resuming %s from step %d (restarts so far: %s)", out, resume, resumed_from)
+    else:
+        # checkpoints left by an earlier run (e.g. a quick smoke test) would otherwise be evaluated
+        # alongside this run's
+        for folder in (out, policy_dir(cfg.policy, resume_run(rm_kind), cfg.seed)):
+            if store.delete_dir(folder):
+                log.warning("deleted old checkpoints in %s before starting", folder)
     prompts = load_prompts("train", cfg.n_prompts)
+    if resume:
+        prompts = unseen_prompts(prompts, cfg, resumed_from)
     dataset = Dataset.from_list(
         [{"prompt": [{"role": "user", "content": user_message(p, cfg.policy)}]} for p in prompts]
     )
 
     args = GRPOConfig(
         output_dir=str(Path(work_dir) / out),
-        learning_rate=cfg.lr,
+        learning_rate=cfg.lr * (cfg.max_steps - resume) / cfg.max_steps,  # where the linear decay had got to
         per_device_train_batch_size=cfg.batch_size,
         gradient_accumulation_steps=cfg.grad_accum,
         num_generations=cfg.num_generations,
@@ -118,25 +182,37 @@ def train_grpo(store: Store, rm_kind: str, cfg: GrpoRunConfig, work_dir: str | P
         gradient_checkpointing=cfg.gradient_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False},  # the variant that works with LoRA
         temperature=cfg.temperature,
+        top_p=cfg.top_p,
+        top_k=cfg.top_k,
         beta=cfg.kl_beta,
-        max_steps=cfg.max_steps,
-        save_steps=max(1, cfg.max_steps // cfg.n_checkpoints),
+        max_steps=cfg.max_steps - resume,
+        # every checkpoint and every resume point; both are multiples of this, and so is `resume`
+        save_steps=math.gcd(max(1, cfg.max_steps // cfg.n_checkpoints), cfg.resume_every),
         logging_steps=5,
         bf16=on_gpu(),
         use_cpu=not on_gpu(),  # lets the CPU integration test run on any laptop
         report_to="wandb" if tracking.active() else "none",
         log_completions=tracking.active(),  # sample answers in W&B, handy for spotting hacking
         seed=cfg.seed,
-        model_init_kwargs={"torch_dtype": str(model_dtype()).removeprefix("torch.")},
+        # TRL only accepts this when it loads the model itself
+        model_init_kwargs=None if resume else {"torch_dtype": str(model_dtype()).removeprefix("torch.")},
     )
+    if resume:
+        base = AutoModelForCausalLM.from_pretrained(POLICIES[cfg.policy], torch_dtype=model_dtype(),
+                                                    use_cache=not cfg.gradient_checkpointing)
+        model, peft_config = PeftModel.from_pretrained(base, adapter, is_trainable=True), None
+    else:
+        model = POLICIES[cfg.policy]
+        peft_config = LoraConfig(task_type="CAUSAL_LM", target_modules="all-linear", **LORA)
     trainer = EvalModeSamplingGRPOTrainer(
-        model=POLICIES[cfg.policy],
+        model=model,
         reward_funcs=make_reward_fn(rm, rm_kind),
         args=args,
         train_dataset=dataset,
-        peft_config=LoraConfig(task_type="CAUSAL_LM", target_modules="all-linear", **LORA),
-        callbacks=[uploader := UploadCheckpoints(store, cfg, rm_kind)],
+        peft_config=peft_config,
+        callbacks=[uploader := UploadCheckpoints(store, cfg, rm_kind, earlier_log, resumed_from)],
     )
+    set_sampling(trainer.model, cfg.temperature, cfg.top_p, cfg.top_k)
     trainer.train()
     uploader.retry_failed()
 
@@ -144,8 +220,9 @@ def train_grpo(store: Store, rm_kind: str, cfg: GrpoRunConfig, work_dir: str | P
     if step % args.save_steps:  # the trainer only saves on multiples of save_steps
         final = Path(args.output_dir) / "final"
         trainer.save_model(str(final))
-        store.upload_dir(final, checkpoint_dir(cfg.policy, rm_kind, step, cfg.seed), allow_patterns=ADAPTER_FILES)
+        store.upload_dir(final, checkpoint_dir(cfg.policy, rm_kind, step + resume, cfg.seed),
+                         allow_patterns=ADAPTER_FILES)
 
-    history = trainer.state.log_history
-    save_log(store, cfg, rm_kind, history, complete=True)
+    history = uploader.full_log(trainer.state.log_history)
+    save_log(store, cfg, rm_kind, history, complete=True, resumed_from=resumed_from)
     return history

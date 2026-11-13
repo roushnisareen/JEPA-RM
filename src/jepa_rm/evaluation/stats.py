@@ -14,7 +14,7 @@ def bootstrap_ci(
     n = len(values)
     means = sorted(sum(rng.choices(values, k=n)) / n for _ in range(n_boot))
     tail = (1 - level) / 2
-    return means[int(tail * n_boot)], means[min(n_boot - 1, int((1 - tail) * n_boot))]
+    return means[round(tail * (n_boot - 1))], means[round((1 - tail) * (n_boot - 1))]
 
 
 def paired_gap(a: dict[str, float], b: dict[str, float]) -> dict:

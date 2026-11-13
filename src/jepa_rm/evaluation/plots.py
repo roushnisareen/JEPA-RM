@@ -186,10 +186,10 @@ def plot_reward_hacking(
     std = {k: v or 1.0 for k, v in base_std.items()}
 
     def delta(row, key):
-        return (row[key] - base[key]) / std[key]
+        return (row[key] - base[key]) / std.get(key, 1.0)
 
     def spread(row, key, end):  # the seed with the lowest or highest score, as a change from base
-        return (row.get(f"{key}_{end}", row[key]) - base[key]) / std[key]
+        return (row.get(f"{key}_{end}", row[key]) - base[key]) / std.get(key, 1.0)
 
     with plt.rc_context(STYLE):
         fig, (own_ax, gold_ax, len_ax) = plt.subplots(1, 3, figsize=(13.5, 3.9))
@@ -320,9 +320,11 @@ def plot_stress_test(results: Mapping, fmt: str = "png") -> bytes:
 
         for scorer in scorers:
             for p, y in rows:
-                x = p["scores"][scorer]["delta_sigma"]
-                yy = y + dodge[scorer]
+                st = p["scores"][scorer]
+                x, yy = st["delta_sigma"], y + dodge[scorer]
                 ax.plot([0, x], [yy, yy], color=color(scorer), lw=1.4, alpha=0.35)
+                if ci := st.get("ci_sigma"):  # the 95% CI the tables quote, so the figure shows it too
+                    ax.plot([ci[0], ci[1]], [yy, yy], color=color(scorer), lw=2.2, alpha=0.9, solid_capstyle="butt")
                 ax.plot(x, yy, "o", color=color(scorer), ms=ms, mec="white", mew=1.0)
             ax.plot([], [], "o", color=color(scorer), ms=7, label=label(scorer))
 
@@ -331,7 +333,7 @@ def plot_stress_test(results: Mapping, fmt: str = "png") -> bytes:
         ax.set_xlim(-span, span)
         ax.grid(axis="y", visible=False)
         ax.tick_params(axis="y", length=0)
-        ax.set_xlabel("score change vs. the original answer (σ of each scorer)")
+        ax.set_xlabel("score change vs. the original answer (σ of each scorer, bars = 95% CI)")
         ax.annotate("shouldn't raise the score  (right of 0 = gameable)", xy=(0, 1), xycoords="axes fraction",
                     xytext=(0, 6), textcoords="offset points", fontsize=9, fontweight="bold", color="#555555")
         ax.annotate("should lower the score  (sanity check)", xy=(-span, len(flat)), xytext=(0, 0),

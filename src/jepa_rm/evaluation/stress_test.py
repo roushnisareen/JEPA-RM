@@ -14,7 +14,6 @@ from dataclasses import dataclass
 
 from jepa_rm.config import SEED
 from jepa_rm.data import PreferencePair
-from jepa_rm.evaluation.stats import bootstrap_ci
 from jepa_rm.rewards import RewardModel
 from jepa_rm.runtime import free_memory
 
@@ -142,14 +141,29 @@ def summarize_scores(
         for scorer, by_variant in scores.items():
             original, edited = by_variant[ORIGINAL], by_variant[pert.name]
             diffs = [e - o for o, e in zip(original, edited, strict=True)]
-            lo, hi = bootstrap_ci(diffs)
             row["scores"][scorer] = {
                 "delta_sigma": statistics.mean(diffs) / spread[scorer],
-                "ci_sigma": [lo / spread[scorer], hi / spread[scorer]],  # 95%, over answers
+                "ci_sigma": list(sigma_ci(diffs, original)),  # 95%, over answers
                 "frac_up": sum(d > 0 for d in diffs) / len(diffs),
             }
         rows.append(row)
     return rows
+
+
+def sigma_ci(
+    diffs: Sequence[float], original: Sequence[float], n_boot: int = 2000, seed: int = SEED
+) -> tuple[float, float]:
+    """Bootstrap CI of mean(diffs) / std(original), resampling answers and recomputing both, so the
+    spread's own uncertainty is in the interval (it matters for a scorer whose scores barely vary)."""
+    rng = random.Random(seed)
+    n = len(diffs)
+    ratios = []
+    for _ in range(n_boot):
+        idx = rng.choices(range(n), k=n)
+        sd = statistics.stdev(original[i] for i in idx) if n > 1 else 0.0
+        ratios.append(statistics.mean(diffs[i] for i in idx) / (sd or 1.0))
+    ratios.sort()
+    return ratios[round(0.025 * (n_boot - 1))], ratios[round(0.975 * (n_boot - 1))]
 
 
 def run_stress_test(examples: Sequence[Example], scorers: Mapping[str, Callable[[], RewardModel]]) -> dict:

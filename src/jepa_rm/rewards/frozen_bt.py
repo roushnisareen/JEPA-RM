@@ -96,7 +96,7 @@ def train_frozen_bt(
 ) -> FrozenBTRM:
     encoder = encoder or Encoder.from_config(cfg, device)
     emb = embeddings or embed_pairs(encoder, pairs, cfg.holdout)
-    torch.manual_seed(SEED)  # same as the JEPA variants
+    torch.manual_seed(SEED)  # same seed as the JEPA variants (batch order is fixed separately in fit_head)
     head = build_head(emb.dim, cfg.predictor_hidden).to(encoder.device)
     rm = FrozenBTRM(cfg, encoder, head, emb.ctx_norm, emb.tgt_norm)
 

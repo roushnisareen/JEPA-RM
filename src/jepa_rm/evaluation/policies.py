@@ -16,13 +16,13 @@ from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer
 
 from jepa_rm import tracking
-from jepa_rm.artifacts import Store, grpo_log_name, rm_dir
+from jepa_rm.artifacts import MissingArtifactError, Store, grpo_log_name, rm_dir
 from jepa_rm.config import POLICIES, SEED, EvalConfig
 from jepa_rm.data import load_prompts, strip_think, user_message
 from jepa_rm.evaluation.plots import plot_reward_hacking, plot_training_curves
 from jepa_rm.evaluation.stats import bootstrap_ci, format_comparisons, paired_gap
 from jepa_rm.rewards import COMPARISONS, REWARD_KINDS, load_reward_model
-from jepa_rm.runtime import default_device, free_memory, model_dtype
+from jepa_rm.runtime import default_device, free_memory, model_dtype, set_sampling
 
 log = logging.getLogger(__name__)
 SCORES = ("gold", *REWARD_KINDS)
@@ -128,6 +128,7 @@ def generate(
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     model = _load_policy(cfg, device, adapter)
+    set_sampling(model, cfg.temperature, cfg.top_p, cfg.top_k)
     eos = model.generation_config.eos_token_id
     eos_ids = set(eos if isinstance(eos, list) else [eos]) | {tok.eos_token_id}
 
@@ -143,7 +144,8 @@ def generate(
         enc = tok(chats, return_tensors="pt", padding=True).to(device)
         with torch.no_grad():
             out = model.generate(
-                **enc, max_new_tokens=cfg.max_new_tokens, do_sample=True, temperature=cfg.temperature, top_p=cfg.top_p
+                **enc, max_new_tokens=cfg.max_new_tokens, do_sample=True, temperature=cfg.temperature, top_p=cfg.top_p,
+                top_k=cfg.top_k,
             )
         answer_ids = out[:, enc["input_ids"].shape[1] :]
         sequences.append((enc["input_ids"], enc["attention_mask"], answer_ids))
@@ -153,10 +155,12 @@ def generate(
     if adapter is None:
         kls = [0.0] * len(texts)
     else:
-        policy_logps = answer_logps(model, sequences)
+        # both log-prob passes in float32: in bf16 the rounding noise between the merged-adapter model
+        # and the fresh base model would show up as a small positive KL for every answer
+        policy_logps = answer_logps(model.float(), sequences)
         del model
         free_memory()
-        model = _load_policy(cfg, device, None)  # a fresh base model: exact, unlike un-merging the adapter
+        model = _load_policy(cfg, device, None).float()  # a fresh base model: exact, unlike un-merging the adapter
         base_logps = answer_logps(model, sequences)
         kls = []
         for (_, _, answer_ids), pol, base in zip(sequences, policy_logps, base_logps, strict=True):
@@ -239,20 +243,29 @@ def aggregate_seeds(seed_rows: list[dict], generations: list[dict]) -> list[dict
 def compare_runs(generations: list[dict], pairs=COMPARISONS) -> list[dict]:
     """Head-to-head gold gaps between runs at each one's final checkpoint, on the same prompts
     (averaged over seeds), with a paired 95% CI."""
-    last: dict[str, int] = {}
+    # each seed's own final checkpoint, so a seed that stopped early still counts at its last step
+    # instead of silently dropping out of the comparison
+    last: dict[tuple[str, int], int] = {}
     for g in generations:
         if g["run"] != "base":
-            last[g["run"]] = max(last.get(g["run"], 0), g["step"])
+            key = (g["run"], g.get("seed", 0))
+            last[key] = max(last.get(key, 0), g["step"])
+    runs = {run for run, _ in last}
 
     def gold_by_prompt(run: str) -> dict[str, float]:
         by_prompt: dict[str, list[float]] = {}
         for g in generations:
-            if g["run"] == run and g["step"] == last[run]:
+            if g["run"] == run and g["step"] == last[(run, g.get("seed", 0))]:
                 by_prompt.setdefault(g["prompt"], []).append(g["gold"])
         return {p: statistics.mean(v) for p, v in by_prompt.items()}
 
-    return [{"a": a, "b": b, "step_a": last[a], "step_b": last[b], **paired_gap(gold_by_prompt(a), gold_by_prompt(b))}
-            for a, b in pairs if a in last and b in last]
+    def final_step(run: str) -> int:
+        return max(step for (r, _), step in last.items() if r == run)
+
+    return [{"a": a, "b": b, "step_a": final_step(a), "step_b": final_step(b),
+             "n_seeds": min(sum(r == a for r, _ in last), sum(r == b for r, _ in last)),
+             **paired_gap(gold_by_prompt(a), gold_by_prompt(b))}
+            for a, b in pairs if a in runs and b in runs]
 
 
 def format_table(rows: list[dict]) -> str:
@@ -278,6 +291,12 @@ def evaluate_policies(store: Store, cfg: EvalConfig) -> list[dict]:
             if not checkpoints:
                 log.warning("no checkpoints for %s/%s seed %d, skipping", cfg.policy, run, seed)
             todo += [(run, seed, step, store.download_dir(folder)) for step, folder in checkpoints]
+    # a seed that's missing is skipped, but a run with no checkpoints at all (a typo in --runs, or
+    # GRPO not finished) would silently turn this into hours of base-model-only evaluation
+    missing = [run for run in cfg.runs if not any(r == run for r, _, _, _ in todo)]
+    if missing:
+        raise MissingArtifactError(f"no checkpoints for {', '.join(missing)} (policy {cfg.policy}, seeds "
+                                   f"{list(cfg.seeds)}): run grpo (or dpo) for them first, or drop them from --runs")
 
     generations = []
     for run, seed, step, adapter in todo:
@@ -287,7 +306,27 @@ def evaluate_policies(store: Store, cfg: EvalConfig) -> list[dict]:
                                 "words": len(gen.response.split()), "truncated": gen.truncated, "kl": gen.kl})
 
     score_all(store, generations, cfg.gold_rm)
+    return summarize_and_save(store, cfg, generations, [(run, seed, step) for run, seed, step, _ in todo])
 
+
+def rescore_policies(store: Store, cfg: EvalConfig) -> list[dict]:
+    """Clean the saved answers with the current `strip_think` and score them again, without
+    generating anything new. The scores from before are kept in a backup next to the result."""
+    name = f"eval_{cfg.policy}.json"
+    saved = store.load_result(name)
+    if saved is None:
+        raise MissingArtifactError(f"no {name}: run evaluate first")
+    store.save_result(f"eval_{cfg.policy}_before_rescore.json", saved)
+    generations = saved["generations"]
+    for g in generations:
+        g["response"] = strip_think(g["response"])
+        g["words"] = len(g["response"].split())
+    score_all(store, generations, cfg.gold_rm)
+    keys = list(dict.fromkeys((g["run"], g["seed"], g["step"]) for g in generations))
+    return summarize_and_save(store, EvalConfig(**saved["config"]), generations, keys)
+
+
+def summarize_and_save(store: Store, cfg: EvalConfig, generations: list[dict], keys: list[Key]) -> list[dict]:
     # the GRPO jobs' logs (possibly from other Modal accounts) give the training curves
     grpo_logs: dict[tuple[str, int], list[dict]] = {}
     for run in (r for r in cfg.runs if r in REWARD_KINDS):
@@ -295,7 +334,7 @@ def evaluate_policies(store: Store, cfg: EvalConfig) -> list[dict]:
             if result := store.load_result(grpo_log_name(cfg.policy, run, seed)):
                 grpo_logs[(run, seed)] = result["log"]
 
-    seed_rows, base_std = summarize_generations(generations, [(run, seed, step) for run, seed, step, _ in todo])
+    seed_rows, base_std = summarize_generations(generations, keys)
     rows = aggregate_seeds(seed_rows, generations)
 
     comparisons = compare_runs(generations)

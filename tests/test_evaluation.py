@@ -1,4 +1,5 @@
 import math
+from dataclasses import asdict
 
 import pytest
 import torch
@@ -204,3 +205,47 @@ def test_runs_are_compared_head_to_head_at_their_final_checkpoints():
     [c] = compare_runs(gens)
     assert (c["a"], c["b"], c["step_a"], c["step_b"]) == ("jepa", "bt", 100, 100)
     assert c["gap"] == pytest.approx(0.5) and c["ci"] == pytest.approx([0.5, 0.5]) and c["n_prompts"] == 3
+
+
+def test_a_seed_that_stopped_early_still_counts_at_its_own_final_checkpoint():
+    from jepa_rm.evaluation.policies import compare_runs
+
+    gens = [generation("base", 0, 0.0, 0, 0, 10, prompt=p) for p in "abc"]
+    gens += [generation("bt", 100, 1.0, 0, 0, 10, prompt=p, seed=0) for p in "abc"]
+    gens += [generation("bt", 50, 3.0, 0, 0, 10, prompt=p, seed=1) for p in "abc"]  # seed 1 ended at step 50
+    gens += [generation("jepa", 100, 1.0, 0, 0, 10, prompt=p) for p in "abc"]
+    [c] = compare_runs(gens)
+    assert c["step_a"] == 100 and c["step_b"] == 100 and c["n_seeds"] == 1
+    assert c["gap"] == pytest.approx(1.0 - 2.0)  # bt averages both seeds' final checkpoints: (1 + 3) / 2
+
+
+def test_a_run_with_no_checkpoints_at_all_is_an_error_not_a_warning(tmp_path):
+    from jepa_rm.artifacts import LocalStore, MissingArtifactError
+    from jepa_rm.config import EvalConfig
+    from jepa_rm.evaluation.policies import evaluate_policies
+
+    with pytest.raises(MissingArtifactError, match="jepa"):
+        evaluate_policies(LocalStore(tmp_path), EvalConfig(runs=("jepa",), seeds=(0,), n_prompts=2))
+
+
+def test_rescore_cleans_saved_answers_and_keeps_the_old_scores(tmp_path, monkeypatch):
+    from jepa_rm.artifacts import LocalStore
+    from jepa_rm.config import EvalConfig
+    from jepa_rm.evaluation import policies
+
+    def fake_score_all(store, generations, gold_rm, **kwargs):  # the judge punishes the stray tag
+        for g in generations:
+            g.update(gold=0.0 if "think>" in g["response"] else 1.0, bt=1.0, jepa=0.0)
+
+    store = LocalStore(tmp_path)
+    gens = [{**generation("base", 0, 1.0, 1.0, 0.0, 2, prompt=p), "response": "an answer", "kl": 0.0} for p in "ab"]
+    gens += [{**generation("bt", 50, 0.0, 1.0, 0.0, 3, prompt=p), "response": "</think>\n\nan answer", "kl": 0.1}
+             for p in "ab"]
+    store.save_result("eval_qwen.json", {"config": asdict(EvalConfig(runs=("bt",))), "generations": gens})
+    monkeypatch.setattr(policies, "score_all", fake_score_all)
+
+    rows = policies.rescore_policies(store, EvalConfig())
+    assert {r["run"]: r["gold"] for r in rows} == {"base": 1.0, "bt": 1.0}
+    saved = store.load_result("eval_qwen.json")
+    assert {g["response"] for g in saved["generations"]} == {"an answer"} and saved["generations"][-1]["words"] == 2
+    assert "</think>" in store.load_result("eval_qwen_before_rescore.json")["generations"][-1]["response"]

@@ -4,7 +4,17 @@ import statistics
 
 import pytest
 
-from jepa_rm.evaluation.best_of_n import best_of_n_curves, bon_kl, expected_best_of_n
+from jepa_rm.config import BonConfig
+from jepa_rm.evaluation.best_of_n import (
+    best_of_n_curves,
+    bon_kl,
+    check_same_sampling,
+    compare_ns,
+    expected_best_of_n,
+    format_verdicts,
+    verdicts,
+    within_prompt_std,
+)
 from jepa_rm.evaluation.plots import plot_reward_hacking
 
 
@@ -101,7 +111,7 @@ def test_extending_reuses_old_samples_and_draws_fresh_ones(tmp_path, monkeypatch
     assert len(samples) == 15 and sorted({s["sample"] for s in samples}) == [0, 1, 2, 3, 4]
     assert len({s["response"] for s in samples}) == 15  # nothing repeated
     assert extended["config"]["n_prompts"] == 3 and extended["config"]["extended_from"] == 2
-    assert store.load_result("best_of_n_qwen_before_extend.json")["samples"] == first
+    assert store.load_result("best_of_n_qwen_before_extend_2.json")["samples"] == first  # named by sample count
 
 
 def test_extending_needs_something_to_extend(tmp_path):
@@ -111,3 +121,54 @@ def test_extending_needs_something_to_extend(tmp_path):
 
     with pytest.raises(ValueError, match="nothing to extend"):
         run_best_of_n(LocalStore(tmp_path), BonConfig(), extend=True)
+
+
+def test_tied_proxy_scores_share_the_pick_instead_of_the_first_sample_taking_it():
+    values = [10.0, 20.0, 30.0, 40.0]
+    assert expected_best_of_n([1.0] * 4, values, 4) == pytest.approx(25.0)  # a blind selector: the plain average
+    assert expected_best_of_n([1.0] * 4, values, 2) == pytest.approx(25.0)
+    assert expected_best_of_n([2.0, 2.0, 1.0, 1.0], values, 4) == pytest.approx(15.0)  # the tied top pair, averaged
+
+
+def long_answers_win(seed=0):
+    """3 prompts x 8 answers; gold likes long answers except the longest, which is bad. 'bt' sees
+    that and keeps improving with n; 'jepa' loves the bad one most, so its picks peak early and fall."""
+    rng = random.Random(seed)
+    out = []
+    for p in range(3):
+        for i in range(8):
+            words = 50 + 10 * i + rng.random()
+            gold = 5 * p + words / 20 if i < 7 else 5 * p - 2.0  # the longest answer is bad
+            out.append({"prompt": f"p{p}", "sample": i, "response": "x" * i, "words": words, "truncated": False,
+                        "gold": gold, "bt": words if i < 7 else 0.0, "jepa": words})
+    return out
+
+
+def test_verdicts_apply_the_pre_registered_rules():
+    samples = long_answers_win()
+    rows, std = best_of_n_curves(samples, ns=(2, 4, 8), selectors=("bt", "jepa"))
+    by = {v["selector"]: v for v in verdicts(rows, samples, std)}
+    assert by["bt"]["optimizable"] and by["bt"]["peak_n"] == 8 and not by["bt"]["hacked"]
+    assert by["bt"]["peak_to_max"] is None  # peak is the largest n: nothing to drop
+    assert by["jepa"]["optimizable"] and by["jepa"]["peak_n"] < 8 and by["jepa"]["hacked"]
+    drop = by["jepa"]["peak_to_max"]
+    assert drop["gap"] < 0 and drop["ci"][1] < 0 and drop["n_prompts"] == 3
+    assert compare_ns(samples, "jepa", by["jepa"]["peak_n"], 8) == drop
+    assert "hacked" in format_verdicts(list(by.values()), std)
+
+
+def test_within_prompt_spread_ignores_differences_between_prompts():
+    samples = long_answers_win()
+    total = best_of_n_curves(samples, ns=(2,), selectors=("bt",))[1]
+    within = within_prompt_std(samples)
+    assert within["gold"] < total["gold"]  # prompts sit 5 points apart; answers to one prompt don't
+    assert within["bt"] == pytest.approx(total["bt"], rel=0.05)  # 'bt' has no between-prompt component
+
+
+def test_extending_or_rescoring_refuses_samples_drawn_with_other_settings():
+    cfg = BonConfig(n_samples=8, ns=(2,))
+    check_same_sampling({"policy": "qwen", "temperature": 1.0, "n_samples": 16}, cfg)  # n_samples may differ
+    with pytest.raises(ValueError, match="temperature"):
+        check_same_sampling({"temperature": 0.7}, cfg)
+    with pytest.raises(ValueError, match="policy"):
+        check_same_sampling({"policy": "phi"}, cfg)

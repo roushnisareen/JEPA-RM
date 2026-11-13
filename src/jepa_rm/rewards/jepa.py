@@ -117,7 +117,7 @@ def train_jepa(
     """Pass `encoder` and `embeddings` to share one embedding pass across several reward models."""
     encoder = encoder or Encoder.from_config(cfg, device)
     emb = embeddings or embed_pairs(encoder, pairs, cfg.holdout)
-    torch.manual_seed(SEED)  # same initialization and batch order for every variant
+    torch.manual_seed(SEED)  # same initialization for every variant (batch order is fixed in fit_head)
     predictor = build_predictor(emb.dim, cfg.predictor_hidden).to(encoder.device)
     rm = JepaRM(cfg, encoder, predictor, emb.ctx_norm, emb.tgt_norm)
 

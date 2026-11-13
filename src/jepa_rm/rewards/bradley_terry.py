@@ -15,7 +15,7 @@ from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_cosine_schedule_with_warmup
 
 from jepa_rm import tracking
-from jepa_rm.config import LORA, BTConfig
+from jepa_rm.config import LORA, SEED, BTConfig
 from jepa_rm.data import PreferencePair, format_text
 from jepa_rm.runtime import default_device, free_memory, model_dtype
 
@@ -27,7 +27,7 @@ def bt_loss(chosen: torch.Tensor, rejected: torch.Tensor) -> torch.Tensor:
     return -F.logsigmoid(chosen - rejected).mean()
 
 
-def _tokenizer(name: str):
+def _tokenizer(name: str | Path):
     tok = AutoTokenizer.from_pretrained(name)
     tok.padding_side = "right"
     return tok
@@ -43,7 +43,7 @@ class BradleyTerryRM:
     def load(cls, path: str | Path, device: str | None = None) -> BradleyTerryRM:
         path = Path(path)
         cfg = BTConfig(**json.loads((path / CONFIG_FILE).read_text()))
-        tok = _tokenizer(cfg.base_model)
+        tok = _tokenizer(path)  # the tokenizer saved with the model, not whatever the hub serves today
         base = AutoModelForSequenceClassification.from_pretrained(
             cfg.base_model, num_labels=1, torch_dtype=model_dtype()
         )
@@ -73,6 +73,7 @@ def train_bradley_terry(
     if steps == 0:
         raise ValueError(f"need at least {cfg.batch_size} pairs, got {len(pairs)}")
 
+    torch.manual_seed(SEED)  # LoRA init and the fresh score head, same as the embedding-space heads
     tok = _tokenizer(cfg.base_model)
     model = AutoModelForSequenceClassification.from_pretrained(cfg.base_model, num_labels=1, torch_dtype=torch.float32)
     model.config.pad_token_id = tok.pad_token_id
@@ -92,7 +93,7 @@ def train_bradley_terry(
         batch = pairs[step * bs : (step + 1) * bs]
         texts = [format_text(p.prompt, p.chosen) for p in batch] + [format_text(p.prompt, p.rejected) for p in batch]
         enc = tok(texts, return_tensors="pt", padding=True, truncation=True, max_length=cfg.max_len).to(device)
-        with torch.autocast(device, dtype=torch.bfloat16, enabled=device == "cuda"):
+        with torch.autocast(torch.device(device).type, dtype=torch.bfloat16, enabled=device.startswith("cuda")):
             rewards = model(**enc).logits[:, 0].float()
         loss = bt_loss(rewards[:bs], rewards[bs:])
         loss.backward()

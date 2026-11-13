@@ -20,6 +20,7 @@ NO_THINK = " /no_think"  # switches off Qwen3's thinking mode
 _MULTI_TURN_MARKER = "<extra_id_1>"
 _SPLITS = {"train": "train", "validation": "val"}  # our split names -> the subset's "split" column
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
+_STRAY_THINK_TAG = re.compile(r"</?think>")  # a GRPO-trained Qwen3 starts every answer with a lone "</think>"
 
 
 @dataclass(frozen=True)
@@ -39,7 +40,7 @@ def user_message(prompt: str, policy: str) -> str:
 
 
 def strip_think(text: str) -> str:
-    return _THINK_BLOCK.sub("", text).strip()
+    return _STRAY_THINK_TAG.sub("", _THINK_BLOCK.sub("", text)).strip()
 
 
 def make_pairs(rows: Iterable[Mapping], max_chars: int = 6000) -> list[PreferencePair]:

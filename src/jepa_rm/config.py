@@ -54,12 +54,23 @@ class JepaConfig:
     holdout: float = 0.05  # share of training pairs used to pick the best epoch
 
 
+# Sampling, for every place answers are generated: temperature 1.0, top-p 1.0, top-k 20.
+# Temperature 1.0 so GRPO, best-of-n and the KL estimate all work with the policy's own
+# distribution. Top-k 20 keeps 1,536-token answers from wandering into junk tokens; it's also
+# Qwen3's own default, and what the 6,400 best-of-n answers were in fact sampled with.
+# These have to reach the model explicitly (runtime.set_sampling): transformers >= 4.50 swaps any
+# setting a caller leaves at its global default (temperature 1.0, top-p 1.0) for the model's own,
+# which for Qwen3 is temperature 0.6 and top-p 0.95.
+
+
 @dataclass(frozen=True)
 class GrpoRunConfig:
     policy: str = "qwen"
     max_steps: int = 200
     n_prompts: int = 2000
-    lr: float = 1e-5
+    # the first pilot at 1e-5 left the policy where it started (KL ~0.001 after 35 steps); 1e-4 is the
+    # one planned increase from the pre-registration
+    lr: float = 1e-4
     # TRL 0.17 generates all batch_size * grad_accum answers at once, then trains on them in
     # grad_accum slices, so each update sees 4 prompts x 8 answers. Slices of 8 keep a training pass
     # at ~9 GB of logits even with 1,536-token answers.
@@ -68,20 +79,32 @@ class GrpoRunConfig:
     num_generations: int = 8
     max_prompt_len: int = 384
     # Qwen3-1.7B writes long, formatted answers: at 768 tokens a GPU check found 31% of them cut off,
-    # which would cap the very length hacking being measured. Cut-off answers get no reward, so the
-    # policy can't win by rambling past the limit, and the share that get cut is logged (clipped_ratio).
+    # which would cap the very length hacking being measured. Cut-off answers are still scored by the
+    # reward model (TRL scores every answer before masking), but with mask_truncated they contribute
+    # no gradient, so the policy isn't pushed to ramble past the limit. The share that get cut is
+    # logged as clipped_ratio.
     max_completion_len: int = 1536
     mask_truncated: bool = True
     # on: without it, backprop through 8 answers of up to 1,536 tokens (and their 151k-way logits)
     # ran out of memory on an 80 GB A100 in a GPU check. The KV cache that checkpointing would
     # otherwise switch off during sampling is kept by sampling in eval mode (training/grpo.py).
     gradient_checkpointing: bool = True
+    # the same sampling everywhere (GRPO, best-of-n, evaluation); see SAMPLING below
     temperature: float = 1.0
+    top_p: float = 1.0
+    top_k: int = 20
     # far too small to hold the policy back, but nonzero so TRL measures KL to the base model,
     # which is the x-axis for the over-optimization plot (Gao et al., 2022)
     kl_beta: float = 1e-3
     n_checkpoints: int = 4
     seed: int = 0  # each seed saves to its own folder, so runs with different seeds sit side by side
+    # continue a run that stopped after saving this checkpoint (see training/grpo.py); 0 starts fresh.
+    # If a resumed run was itself cut off (Modal restarts a preempted job with the same arguments),
+    # it carries on from the latest resume point instead.
+    resume_step: int = 0
+    # extra adapters saved this often, only to restart from; kept apart from the checkpoints, so
+    # evaluation never sees them. A preemption then costs at most this many steps.
+    resume_every: int = 10
 
 
 @dataclass(frozen=True)
@@ -105,8 +128,11 @@ class EvalConfig:
     n_prompts: int = 200
     batch_size: int = 32
     max_new_tokens: int = 1536  # same as GrpoRunConfig.max_completion_len
-    temperature: float = 0.7
-    top_p: float = 0.95
+    # the same sampling as GRPO: KL to the base model is estimated from these answers, which is only
+    # right when they come from the distribution being trained
+    temperature: float = 1.0
+    top_p: float = 1.0
+    top_k: int = 20
     gold_rm: str = GOLD_RM
 
 
@@ -121,7 +147,9 @@ class BonConfig:
     # typically sets in for best-of-n (Gao et al., 2022)
     n_samples: int = 64
     ns: tuple[int, ...] = (2, 4, 8, 16, 32, 64)
-    temperature: float = 1.0  # same sampling as GRPO, so both methods search the same distribution
+    # same sampling as GRPO, so both methods search the same distribution
+    temperature: float = 1.0
+    top_k: int = 20
     max_new_tokens: int = 1536  # same as GrpoRunConfig.max_completion_len
     batch_size: int = 64
     gold_rm: str = GOLD_RM

@@ -123,6 +123,6 @@ def format_pooling(result: Mapping) -> str:
                      f"{r['gold_change_sigma']:>+13.2f}")
     lines += ["", "paired: gold of last-pooling picks − mean-pooling picks, same answers (σ)"]
     for r in result["paired_best_of_n"]:
-        lines.append(f"{r['kind']:<11} @{r['n']:<4}{r['gap_sigma']:+.3f} {ci(r['ci_sigma'])}"
-                     f"  ({r['n_prompts']} prompts)")
+        gap = f"{r['gap_sigma']:+.3f}" if r["gap_sigma"] is not None else "-"
+        lines.append(f"{r['kind']:<11} @{r['n']:<4}{gap} {ci(r['ci_sigma'])}  ({r['n_prompts']} prompts)")
     return "\n".join(lines)

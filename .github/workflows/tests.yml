@@ -20,7 +20,7 @@ jobs:
       - run: pytest -m "not integration"
 
   integration:
-    # every stage end to end on tiny models; downloads ~80 MB of them from the HF Hub
+    # every stage end to end on tiny models; downloads ~60 MB of them from the HF Hub
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -46,6 +46,7 @@ def test_select_prompts_respects_n():
 def test_strip_think_removes_thinking_blocks():
     assert strip_think("<think>\nhmm\n</think>\n\nanswer") == "answer"
     assert strip_think("no thinking here") == "no thinking here"
+    assert strip_think("</think>\n\n## Answer") == "## Answer"
 
 
 def test_user_message_only_disables_thinking_for_qwen():

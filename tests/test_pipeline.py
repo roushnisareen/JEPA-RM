@@ -7,6 +7,7 @@ nothing; the point is that nothing crashes and every artifact lands where the ne
 
 Needs network once to download the tiny models (~20 MB each). Skip with `pytest -m "not integration"`.
 """
+import shutil
 from dataclasses import replace
 
 import pytest
@@ -78,7 +79,9 @@ def test_full_pipeline_runs_on_cpu(tiny, tmp_path):
     for kind in REWARD_KINDS:
         store.upload_dir(work / "rms" / rm_dir(kind), rm_dir(kind))
         reloaded = load_reward_model(kind, store.download_dir(rm_dir(kind)))
-        assert len(reloaded.score(PROMPTS[:2], ["a short answer", "another one"])) == 2
+        # a reloaded model must score exactly as the trained one did (weights, standardizers, config)
+        fresh, again = (m.score(PROMPTS[:2], ["a short answer", "another one"]) for m in (models[kind], reloaded))
+        assert again == pytest.approx(fresh, abs=1e-4), kind
 
     comparison = compare_reward_models(PAIRS[:6], models)
     assert set(comparison["models"]) == set(REWARD_KINDS)
@@ -113,6 +116,23 @@ def test_full_pipeline_runs_on_cpu(tiny, tmp_path):
     grpo.train_grpo(store, "bt", replace(GRPO_CFG, seed=1), work_dir=work)
     assert store.checkpoints("qwen", "bt", seed=1) == [(2, "policy_qwen_bt_s1/checkpoint-2")]
     assert store.checkpoints("qwen", "bt") == [(2, "policy_qwen_bt/checkpoint-2")]
+    # a run that stopped continues from its checkpoint, keeping it, and its log carries on from there
+    # (on a copy, so the evaluation below still sees both seeds ending at the same step)
+    resumed = LocalStore(shutil.copytree(store.root, work / "resumed_store"))
+    resume_cfg = replace(GRPO_CFG, max_steps=4, n_checkpoints=2, resume_step=2, resume_every=1)
+    history = grpo.train_grpo(resumed, "bt", resume_cfg, work_dir=work / "resumed")
+    assert resumed.checkpoints("qwen", "bt") == [(2, "policy_qwen_bt/checkpoint-2"),
+                                                 (4, "policy_qwen_bt/checkpoint-4")]
+    assert resumed.checkpoints("qwen", "bt_resume") == [(3, "policy_qwen_bt_resume/checkpoint-3")]
+    steps = [e["step"] for e in history if "reward" in e]
+    assert steps == sorted(steps) and steps[-1] > 2
+    assert resumed.load_result("grpo_qwen_bt.json")["log"] == history
+    # Modal restarts a preempted job with the same arguments: it picks up from the latest resume point
+    grpo.train_grpo(resumed, "bt", resume_cfg, work_dir=work / "restarted")
+    restarted = resumed.load_result("grpo_qwen_bt.json")
+    assert restarted["resumed_from"] == [2, 3] and restarted["complete"]
+    assert resumed.checkpoints("qwen", "bt") == [(2, "policy_qwen_bt/checkpoint-2"),
+                                                 (4, "policy_qwen_bt/checkpoint-4")]
 
     # 4. DPO baseline
     dpo.train_dpo(store, DpoRunConfig(max_pairs=8, batch_size=2, grad_accum=1, max_len=128, max_prompt_len=64),

@@ -183,10 +183,13 @@ def fit_head(
     loss_fn(idx) is the training loss on pairs idx; scores_fn(idx) gives (chosen, rejected) scores.
     """
     opt = torch.optim.AdamW(head.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    # its own generator, so every head sees the same batch order however many random draws its
+    # initialization used up
+    order = torch.Generator().manual_seed(SEED)
     best_acc, best_state = -1.0, None
     for epoch in range(cfg.epochs):
         head.train()
-        perm = emb.fit[torch.randperm(len(emb.fit), device=emb.fit.device)]
+        perm = emb.fit[torch.randperm(len(emb.fit), generator=order).to(emb.fit.device)]
         losses = []
         for i in range(0, len(perm), cfg.batch_size):
             loss = loss_fn(perm[i : i + cfg.batch_size])
